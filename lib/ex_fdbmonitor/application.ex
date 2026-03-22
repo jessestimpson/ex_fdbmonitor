@@ -5,33 +5,42 @@ defmodule ExFdbmonitor.Application do
 
   use Application
 
+  alias ExFdbmonitor.Bootstrap
+
   @impl true
   def start(_type, _args) do
-    children =
+    {children, bootstrap} =
       if worker?() do
         etc_dir = Application.fetch_env!(:ex_fdbmonitor, :etc_dir)
 
         # Phase 1: write config files before any processes start
-        {cluster_file, machine_id, fdbcli_cmds, redundancy_mode} = prepare_files(etc_dir)
+        %Bootstrap{} = bootstrap = prepare_files(etc_dir)
 
-        [
+        children = [
           {DynamicSupervisor, name: ExFdbmonitor.DynamicSupervisor, strategy: :one_for_one},
           {ExFdbmonitor.Worker, []},
-          # Phase 2: run fdbcli commands and start MgmtServer (requires Worker running)
-          %{
-            id: :setup_cluster,
-            start:
-              {__MODULE__, :setup_cluster,
-               [cluster_file, fdbcli_cmds, machine_id, redundancy_mode]},
-            restart: :temporary
-          }
+          {ExFdbmonitor.SetupCluster, bootstrap}
         ]
+
+        {children, bootstrap}
       else
-        []
+        {[], nil}
       end
 
-    opts = [strategy: :one_for_one, name: ExFdbmonitor.Supervisor]
-    Supervisor.start_link(children, opts)
+    # Use rest_for_one: if Worker dies, SetupCluster is terminated and
+    # restarted so it retries setup against the fresh Worker.
+    opts = [strategy: :rest_for_one, name: ExFdbmonitor.Supervisor]
+    {:ok, sup} = Supervisor.start_link(children, opts)
+
+    # Block until cluster setup is complete. The supervisor is alive and
+    # can restart Worker if it crashes. If Worker keeps crashing, the
+    # supervisor hits max_restart_intensity, crashes, and this call
+    # propagates the error — failing application startup.
+    if bootstrap do
+      :ok = ExFdbmonitor.SetupCluster.await()
+    end
+
+    {:ok, sup}
   end
 
   defp worker?() do
@@ -52,9 +61,8 @@ defmodule ExFdbmonitor.Application do
   end
 
   # Phase 1: prepare all files on disk (cluster file, conffile, dirs).
-  # Returns {cluster_file, machine_id, fdbcli_cmds, redundancy_mode} where
-  # fdbcli_cmds and redundancy_mode are deferred to phase 2 since they
-  # require a running fdbserver.
+  # Returns a %Bootstrap{} struct. fdbcli_cmds and redundancy_mode are
+  # deferred to phase 2 since they require a running fdbserver.
   defp prepare_files(etc_dir) do
     conffile = Path.expand(Path.join([etc_dir, "foundationdb.conf"]))
 
@@ -68,7 +76,7 @@ defmodule ExFdbmonitor.Application do
       write_bootstrap_files(bootstrap_config, etc_dir, conffile)
     else
       cluster_file = ExFdbmonitor.Cluster.file(etc_dir)
-      {cluster_file, nil, [], nil}
+      %Bootstrap{cluster_file: cluster_file}
     end
   end
 
@@ -134,8 +142,15 @@ defmodule ExFdbmonitor.Application do
     fdbcli_cmds = fdbcli_cmds ++ explicit_cmds
 
     redundancy_mode = bootstrap_config[:conf][:redundancy_mode]
+    fdbserver_ports = Enum.map(fdbservers, & &1[:port])
 
-    {cluster_file, resolved[:machine_id], fdbcli_cmds, redundancy_mode}
+    %Bootstrap{
+      cluster_file: cluster_file,
+      machine_id: resolved[:machine_id],
+      fdbcli_cmds: fdbcli_cmds,
+      redundancy_mode: redundancy_mode,
+      fdbserver_ports: fdbserver_ports
+    }
   end
 
   defp fdb_node?(node) do
@@ -143,34 +158,6 @@ defmodule ExFdbmonitor.Application do
       {:badrpc, _} -> false
       apps -> not is_nil(List.keyfind(apps, :ex_fdbmonitor, 0))
     end
-  end
-
-  # Phase 2: run fdbcli commands, register node, and optionally set redundancy mode.
-  # Called as a child start function after Worker is running.
-  # Returns :ignore so the supervisor treats this as a completed one-shot.
-  @doc false
-  def setup_cluster(cluster_file, fdbcli_cmds, machine_id, redundancy_mode) do
-    for cmd <- fdbcli_cmds do
-      case cmd do
-        ["configure", "new" | _] ->
-          Logger.notice("#{node()} fdbcli local exec #{inspect(cmd)}")
-          {:ok, [stdout: _]} = ExFdbmonitor.Fdbcli.exec(cmd)
-
-        _ ->
-          ensure_mgmt_server(cluster_file)
-          {:ok, [stdout: _]} = ExFdbmonitor.MgmtServer.exec(cmd)
-      end
-    end
-
-    ensure_mgmt_server(cluster_file)
-
-    if machine_id do
-      :ok = ExFdbmonitor.MgmtServer.register_node(machine_id, node())
-    end
-
-    :ok = ExFdbmonitor.MgmtServer.scale_up(redundancy_mode, [node()])
-
-    :ignore
   end
 
   defp check_config() do
@@ -182,12 +169,12 @@ defmodule ExFdbmonitor.Application do
       system_memory_data = :memsup.get_system_memory_data()
       system_total_memory = system_memory_data[:system_total_memory]
 
-      system_memory_threshold_GB = 8
+      system_memory_threshold_gb = 8
 
-      if system_total_memory < system_memory_threshold_GB * 1_000_000_000 do
+      if system_total_memory < system_memory_threshold_gb * 1_000_000_000 do
         Logger.warning("""
-        System memory is less than #{system_memory_threshold_GB}GB. \
-        FoundationDB is tuned for systems that can allocate #{system_memory_threshold_GB}GB of system memory per core/disk.
+        System memory is less than #{system_memory_threshold_gb}GB. \
+        FoundationDB is tuned for systems that can allocate #{system_memory_threshold_gb}GB of system memory per core/disk.
         """)
       end
     end
@@ -213,26 +200,5 @@ defmodule ExFdbmonitor.Application do
     end
 
     !already_started?
-  end
-
-  defp ensure_mgmt_server(cluster_file) do
-    case GenServer.whereis(ExFdbmonitor.MgmtServer) do
-      pid when is_pid(pid) ->
-        :ok
-
-      nil ->
-        db = :erlfdb.open(cluster_file)
-        root = :erlfdb_directory.root()
-        dir_name = Application.get_env(:ex_fdbmonitor, :dir, "ex_fdbmonitor")
-        dir = :erlfdb_directory.create_or_open(db, root, dir_name)
-
-        {:ok, _} =
-          DynamicSupervisor.start_child(
-            ExFdbmonitor.DynamicSupervisor,
-            {ExFdbmonitor.MgmtServer, {db, dir}}
-          )
-
-        :ok
-    end
   end
 end

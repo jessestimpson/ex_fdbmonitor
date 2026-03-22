@@ -1,7 +1,6 @@
 defmodule ExFdbmonitor.Worker do
   @moduledoc false
-  defp fdbmonitor(),
-    do: Application.get_env(:ex_fdbmonitor, :fdbmonitor, "/usr/local/libexec/fdbmonitor")
+  defp fdbmonitor(), do: ExFdbmonitor.Binaries.fdbmonitor()
 
   def child_spec(init_arg) do
     default = %{
@@ -21,7 +20,16 @@ defmodule ExFdbmonitor.Worker do
     File.mkdir_p!(Path.dirname(conffile))
     File.mkdir_p!(Path.dirname(lockfile))
 
-    cmd = [fdbmonitor(), "--conffile", conffile, "--lockfile", lockfile]
+    fdbmonitor_bin = fdbmonitor()
+
+    if !File.exists?(fdbmonitor_bin) do
+      raise "fdbmonitor binary not found at #{fdbmonitor_bin}"
+    end
+
+    cmd =
+      [fdbmonitor_bin, "--conffile", conffile, "--lockfile", lockfile]
+      |> Enum.map(&String.to_charlist/1)
+
     {:ok, pid, _os_pid} = :exec.run_link(cmd, [])
     {:ok, pid}
   end

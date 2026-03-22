@@ -5,12 +5,14 @@ defmodule ExFdbmonitor.MixProject do
     [
       app: :ex_fdbmonitor,
       description: "A tool for creating FoundationDB clusters",
-      version: "0.2.0",
+      version: "0.2.1",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      aliases: [
-        test: "test --no-start"
+      aliases: aliases(),
+      dialyzer: [
+        ignore_warnings: ".dialyzer_ignore.exs",
+        plt_add_apps: [:erlexec, :dgen, :os_mon]
       ],
       package: package(),
       docs: docs()
@@ -20,7 +22,7 @@ defmodule ExFdbmonitor.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger, :global_flags],
+      extra_applications: [:logger, :crypto, :eex, :global_flags],
       included_applications: [:os_mon],
       mod: {ExFdbmonitor.Application, []}
     ]
@@ -32,11 +34,11 @@ defmodule ExFdbmonitor.MixProject do
       {:global_flags, "~> 1.0"},
       {:erlexec, "~> 2.0"},
       {:local_cluster, "~> 2.0"},
+      {:credo, "~> 1.6", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.16", only: :dev, runtime: false},
       {:erlfdb, "~> 0.3"},
       {:dgen, "~> 0.1"}
-      # {:dep_from_hexpm, "~> 0.3.0"},
-      # {:dep_from_git, git: "https://github.com/elixir-lang/my_dep.git", tag: "0.1.0"}
     ]
   end
 
@@ -46,6 +48,18 @@ defmodule ExFdbmonitor.MixProject do
       links: %{
         "GitHub" => "https://github.com/foundationdb-beam/ex_fdbmonitor"
       }
+    ]
+  end
+
+  defp aliases do
+    [
+      test: "test --no-start",
+      lint: [
+        "format --check-formatted",
+        "deps.unlock --check-unused",
+        "credo --all --strict",
+        "dialyzer --format short"
+      ]
     ]
   end
 
